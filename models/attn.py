@@ -491,7 +491,6 @@ class LocalAttention(nn.Module):
             self.split_indexes_KV_end = torch.tensor(split_indexes_end)
             self.split_indexes_KV_end[window_size-self.splits*l1:] = torch.zeros((self.splits+1)*l1 + self.neigh_size - window_size)
 
-
     def forward(self, queries, keys, values):
         """
         Forward pass of the local attention mechanism.
@@ -621,8 +620,7 @@ class LocalAttention(nn.Module):
         output = torch.cat(torch.tensor_split(output, torch.arange(1,self.splits + 1*(self.splits*l1 < self.window_size)), 0),2).squeeze(0)
         output_refined = output[:,:self.window_size,:,:]
         if self.output_attention:
-            #return (output.contiguous(), A)
-            return (output_refined.contiguous(), torch.cat(A, 2)[:,:,self.neigh_size:self.window_size+self.neigh_size,:])
+            return (output_refined.contiguous(),A.contiguous())
         else:
             return (output_refined.contiguous(), None)
 
