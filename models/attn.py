@@ -452,8 +452,8 @@ class LocalAttention(nn.Module):
         # l1 x (l1+self.neigh_size)
         # (L-l_end) x (L-l_end+self.neigh_size)
         # We have a row for each input, and in each row we have the neigh_size ones corresponding to the attention scores computed.
-        self.local_mask_start = torch.cat((torch.full((l1, l1), -sys.maxsize), full_mask[0:l1, 0:l1]), dim=1)
-        self.local_mask_middle = full_mask[l1:2*l1, l1-self.neigh_size:2*l1]
+        self.local_mask_start = torch.cat((torch.full((l1, l1 - 1), -sys.maxsize), full_mask[0:l1, 0:l1]), dim=1)
+        self.local_mask_middle = full_mask[l1:2*l1, l1-self.neigh_size + 1:2*l1]
         self.local_mask_end = self.local_mask_middle.clone()
         self.local_mask_end[window_size-l1*self.splits:,:] = -sys.maxsize
 
@@ -479,10 +479,10 @@ class LocalAttention(nn.Module):
         split_indexes = [] 
         self.split_indexes_KV_end = None
         for j in torch.arange(0, self.splits):
-            for i in torch.arange(0, l1+self.neigh_size):
+            for i in torch.arange(1, l1+self.neigh_size):
                 split_indexes.append(i+l1*j-self.neigh_size)
-        self.split_indexes_KV = torch.tensor(split_indexes).reshape(self.splits, l1+self.neigh_size)
-        self.split_indexes_KV[0] = torch.cat((torch.zeros(self.neigh_size), torch.arange(0, l1)), 0)
+        self.split_indexes_KV = torch.tensor(split_indexes).reshape(self.splits, l1+self.neigh_size-1)
+        self.split_indexes_KV[0] = torch.cat((torch.zeros(self.neigh_size-1), torch.arange(0, l1)), 0)
         
         if self.splits*l1 < window_size:
             split_indexes_end = []
