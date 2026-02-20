@@ -454,7 +454,7 @@ class LocalAttention(nn.Module):
         # We have a row for each input, and in each row we have the neigh_size ones corresponding to the attention scores computed.
         self.local_mask_start = full_mask[0:l1, 0:l1]
         self.local_mask_middle = full_mask[l1:2*l1, l1-self.neigh_size:2*l1]
-        self.local_mask_end = self.local_mask_middle
+        self.local_mask_end = self.local_mask_middle.clone()
         self.local_mask_end[window_size-l1*self.splits:,:] = -sys.maxsize
 
         # Indexes where we will split Q.
@@ -559,6 +559,21 @@ class LocalAttention(nn.Module):
         # We scale the product Q K^T by multiplying by scale (usually 1/Sqrt(E))
         self.scale = self.scale or 1./math.sqrt(E)
 
+        # Dynamically recalculate chunking indices and masks if the sequence length changes
+        if self.window_size != L:
+            # Force recalculation of optimal splits for the current sequence length
+            self.splits = L // self.neigh_size 
+            self.config(window_size=L)
+            
+            # Ensure the newly generated index tensors are on the correct GPU/device
+            self.split_indexes_Q = self.split_indexes_Q.to(queries.device)
+            self.split_indexes_KV = self.split_indexes_KV.to(keys.device)
+            if self.split_indexes_Q_end is not None:
+                self.split_indexes_Q_end = self.split_indexes_Q_end.to(queries.device)
+            if self.split_indexes_KV_end is not None:
+                self.split_indexes_KV_end = self.split_indexes_KV_end.to(keys.device)
+        # ----
+
         # BUG: window size is 1 at some point of the execution, therefore this does not works. This could be due to
         # changing the model from autoencoder to predictor, but it should not happen. Check this.
         l1 = self.window_size//self.splits
@@ -599,8 +614,10 @@ class LocalAttention(nn.Module):
         # Scale the scores and apply softmax to compute the attention matrix (not applied S1 locally at the moment...)
         A = self.dropout(torch.softmax(self.scale * S_masked, dim=-1))
         
+        # print(f"A type: {A.dtype}, V_split type: {V_split.dtype}")
+
         # Compute V as the sum A_ij values_j over j
-        output = torch.einsum("sbhlt,sbthd->sblhd", A, V_split)
+        output = torch.einsum("sbhlt,sbthd->sblhd", A.float(), V_split.float())
         output = torch.cat(torch.tensor_split(output, torch.arange(1,self.splits + 1*(self.splits*l1 < self.window_size)), 0),2).squeeze(0)
         output_refined = output[:,:self.window_size,:,:]
         if self.output_attention:
