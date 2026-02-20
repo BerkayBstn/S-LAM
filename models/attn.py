@@ -452,7 +452,7 @@ class LocalAttention(nn.Module):
         # l1 x (l1+self.neigh_size)
         # (L-l_end) x (L-l_end+self.neigh_size)
         # We have a row for each input, and in each row we have the neigh_size ones corresponding to the attention scores computed.
-        self.local_mask_start = full_mask[0:l1, 0:l1]
+        self.local_mask_start = torch.cat((torch.full((l1, l1), -sys.maxsize), full_mask[0:l1, 0:l1]), dim=1)
         self.local_mask_middle = full_mask[l1:2*l1, l1-self.neigh_size:2*l1]
         self.local_mask_end = self.local_mask_middle.clone()
         self.local_mask_end[window_size-l1*self.splits:,:] = -sys.maxsize
@@ -491,7 +491,7 @@ class LocalAttention(nn.Module):
             self.split_indexes_KV_end = torch.tensor(split_indexes_end)
             self.split_indexes_KV_end[window_size-self.splits*l1:] = torch.zeros((self.splits+1)*l1 + self.neigh_size - window_size)
 
-    def forward(self, queries, keys, values):
+    def forward(self, queries, keys, values, debugging = False):
         """
         Forward pass of the local attention mechanism.
 
@@ -606,9 +606,16 @@ class LocalAttention(nn.Module):
 
         S = torch.einsum("sblhe,sbthe->sbhlt", Q_split, K_split)
         # BUG: local_mask_middle turns into empty at some point and this line fails.
-        S_masked = S + self.local_mask_middle
+        S_masked = torch.zeros_like(S)
+        S_masked[0] = S[0] + self.local_mask_start
+
         if self.splits*l1 < self.window_size:
-            S_masked[-1, :, :, :] = S_masked[-1, :, :, :] + self.local_mask_end   
+            S_masked[1:-1] = S[1:-1] + self.local_mask_middle
+            S_masked[-1, :, :, :] = S_masked[-1, :, :, :] + self.local_mask_end  
+
+        else:
+            S_masked[1:] = S[1:] + self.local_mask_middle
+
         S_masked = S_masked.nan_to_num(-sys.maxsize) # makes sure there is no np.inf * 0 product producing Nan, if so we send it back to -np.inf
         # Scale the scores and apply softmax to compute the attention matrix (not applied S1 locally at the moment...)
         A = self.dropout(torch.softmax(self.scale * S_masked, dim=-1))
@@ -619,6 +626,9 @@ class LocalAttention(nn.Module):
         output = torch.einsum("sbhlt,sbthd->sblhd", A.float(), V_split.float())
         output = torch.cat(torch.tensor_split(output, torch.arange(1,self.splits + 1*(self.splits*l1 < self.window_size)), 0),2).squeeze(0)
         output_refined = output[:,:self.window_size,:,:]
+        if debugging:
+            return Q_split, K_split, V_split, S, S_masked, A, V_split, output_refined
+
         if self.output_attention:
             return (output_refined.contiguous(),A.contiguous())
         else:
@@ -708,6 +718,8 @@ class AttentionLayer(nn.Module):
         self.inner_attention.config(window_size)
 
     def forward(self, queries, keys, values, **kwargs):
+        
+        debugging = kwargs.get('debugging', False)
         # Extracts the dimensions of queries, keys, values.
         # B is the number of batches, L is the number of instances of the queries,
         # S is the number of instnaces of the keys.
@@ -723,11 +735,16 @@ class AttentionLayer(nn.Module):
         values = self.value_projection(values).view(B, S, H, -1)
 
         # Applies the attention mechanism.
-        out, attn = self.inner_attention(
-            queries,
-            keys,
-            values
-        )
+        if debugging and isinstance(self.inner_attention, LocalAttention):
+            Q_split, K_split, V_split, S, S_masked, A, V_split, output_refined = self.inner_attention(
+                queries,
+                keys,
+                values,
+                debugging=debugging
+            )
+            return Q_split, K_split, V_split, S, S_masked, A, V_split, output_refined
+        else:
+            out, attn = self.inner_attention(queries, keys, values)
 
         # Places for each variable, all the outputs of the heads for that variable continuously.
         if self.mix:
