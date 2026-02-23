@@ -367,6 +367,8 @@ class LocalAttention(nn.Module):
         self.local_mask_end = None
         self.window_size = None
         self.split_indexes = None
+        self.l1 = None
+        self.remainder = None
         self.device = device
  
     def config(self, window_size):
@@ -433,63 +435,42 @@ class LocalAttention(nn.Module):
         # Update splits if needed
         if self.splits == None or self.splits < 0 or self.neigh_size > self.window_size / self.splits:
             self.splits = self.window_size // self.neigh_size
-        l1 = window_size//self.splits # splits may not divide window_size, need to do this generalization and check if performance is affected
-        #l1_rest = window_size - (self.splits-1)*l1
-        l_end = (self.splits-1)*l1
+        self.l1 = self.window_size//self.splits # splits may not divide window_size, need to do this generalization and check if performance is affected
 
         # Compute the full mask M described in the comment above.
-        full_mask = torch.tril(torch.ones((window_size,window_size), dtype=torch.double)) - torch.tril(torch.ones((window_size,window_size), dtype=torch.double),diagonal=-self.neigh_size)
-        full_mask = full_mask.to(self.device)
+        self.full_mask = torch.tril(torch.ones((self.window_size, self.window_size), dtype=torch.double)) - torch.tril(torch.ones((self.window_size, self.window_size), dtype=torch.double),diagonal=-self.neigh_size)
+        self.full_mask = self.full_mask.to(self.device)
         #Replace 0 with -np.inf
-        full_mask = full_mask.masked_fill(full_mask == 0, -sys.maxsize)
-        full_mask = full_mask.masked_fill(full_mask == 1, 0)
-        #np_mask = np.array([ [-np.inf]*j + [1]*self.neigh_size + [-np.inf]*(window_size-j) for j in torch.arange(0, window_size)])
-        #np_mask = np_mask[0:window_size, self.neigh_size-1:window_size+self.neigh_size-1]
-        #full_mask = torch.from_numpy(np_mask)
+        self.full_mask = self.full_mask.masked_fill(self.full_mask == 0, -sys.maxsize)
+        self.full_mask = self.full_mask.masked_fill(self.full_mask == 1, 0)
 
         # Local masks have dimensions:
         # l1 x l1
         # l1 x (l1+self.neigh_size)
         # (L-l_end) x (L-l_end+self.neigh_size)
         # We have a row for each input, and in each row we have the neigh_size ones corresponding to the attention scores computed.
-        self.local_mask_start = torch.cat((torch.full((l1, l1 - 1), -sys.maxsize), full_mask[0:l1, 0:l1]), dim=1)
-        self.local_mask_middle = full_mask[l1:2*l1, l1-self.neigh_size + 1:2*l1]
+        self.local_mask_start = torch.cat((torch.full((self.l1, self.l1 - 1), -sys.maxsize), self.full_mask[0:self.l1, 0:self.l1]), dim=1)
+        self.local_mask_middle = self.full_mask[self.l1:2*self.l1, self.l1-self.neigh_size + 1:2*self.l1]
         self.local_mask_end = self.local_mask_middle.clone()
-        self.local_mask_end[window_size-l1*self.splits:,:] = -sys.maxsize
+        self.local_mask_end[self.window_size-self.l1*self.splits:,:] = -sys.maxsize
 
         # Indexes where we will split Q.
-        #self.split_indexes = (j*l1 for j in torch.arange(1, self.splits))
-        # Vectorize the line before
-        #BUG: Should this be torch.arange(1, self.splits+1)*l1 ?
-        split_indexes = []
-        self.split_indexes_Q_end = None
-        for j in torch.arange(0, self.splits):
-            for i in torch.arange(0, l1):
-                split_indexes.append(i+l1*j)
-        self.split_indexes_Q = torch.tensor(split_indexes).reshape(self.splits, l1)
+        i = torch.arange(self.l1)
+        j = torch.arange(self.l1 + self.neigh_size - 1)
+        r = torch.arange(self.splits)
 
-        if self.splits*l1 < window_size:
-            split_indexes_end = []
-            for i in torch.arange(0, l1):
-                split_indexes_end.append(i+l1*self.splits)
-            self.split_indexes_Q_end = torch.tensor(split_indexes_end)
-            self.split_indexes_Q_end[window_size-self.splits*l1:] = torch.zeros((self.splits+1)*l1 - window_size)
+        self.split_indexes_Q =  r.unsqueeze(1) * self.l1 + i.unsqueeze(0) # i_glob = (r x l1) + i
+        self.split_indexes_KV = r.unsqueeze(1)*self.l1 - self.neigh_size + 1 + j.unsqueeze(0) # j_glob = (r x l1) - neigh_size + 1 + j
+        self.split_indexes_KV[0, :self.neigh_size-1] = 0
         
-        # Matrix SI such that for split i, the block i of K has the rows with index in SI[i,:]
-        split_indexes = [] 
-        self.split_indexes_KV_end = None
-        for j in torch.arange(0, self.splits):
-            for i in torch.arange(1, l1+self.neigh_size):
-                split_indexes.append(i+l1*j-self.neigh_size)
-        self.split_indexes_KV = torch.tensor(split_indexes).reshape(self.splits, l1+self.neigh_size-1)
-        self.split_indexes_KV[0] = torch.cat((torch.zeros(self.neigh_size-1), torch.arange(0, l1)), 0)
-        
-        if self.splits*l1 < window_size:
-            split_indexes_end = []
-            for i in torch.arange(0, l1 + self.neigh_size):
-                split_indexes_end.append(i+l1*self.splits-self.neigh_size)
-            self.split_indexes_KV_end = torch.tensor(split_indexes_end)
-            self.split_indexes_KV_end[window_size-self.splits*l1:] = torch.zeros((self.splits+1)*l1 + self.neigh_size - window_size)
+        if self.splits*self.l1 < self.window_size:
+            self.remainder = self.window_size-self.splits*self.l1
+
+            self.split_indexes_Q_end = self.l1 * self.splits + torch.arange(self.l1)
+            self.split_indexes_Q_end[self.remainder:] = torch.zeros(self.l1 - self.remainder)
+
+            self.split_indexes_KV_end = self.l1*self.splits - self.neigh_size + torch.arange(self.l1 + self.neigh_size - 1)
+            self.split_indexes_KV_end[self.remainder:] = 0
 
     def forward(self, queries, keys, values, debugging = False):
         """
@@ -575,12 +556,12 @@ class LocalAttention(nn.Module):
 
         # BUG: window size is 1 at some point of the execution, therefore this does not works. This could be due to
         # changing the model from autoencoder to predictor, but it should not happen. Check this.
-        l1 = self.window_size//self.splits
+        self.l1 = self.window_size//self.splits
 
         # Split queries
         Q_expand = queries.unsqueeze(0).expand(self.splits, B, L, H, E).permute(1,0,2,3,4)
         Q_split = Q_expand[:, torch.arange(self.splits).unsqueeze(1), self.split_indexes_Q, :].transpose(0,1)
-        if self.splits*l1 < self.window_size:
+        if self.splits*self.l1 < self.window_size:
             Q_end = queries[:,self.split_indexes_Q_end,:,:]
             Q_split = torch.cat((Q_split,Q_end.unsqueeze(0)), 0)
         
@@ -588,7 +569,7 @@ class LocalAttention(nn.Module):
         K_expand = keys.unsqueeze(0).expand(self.splits, B, L, H, E).permute(1,0,2,3,4)
         K_split = K_expand[:, torch.arange(self.splits).unsqueeze(1), self.split_indexes_KV, :].transpose(0,1)
         K_split[0,:,:self.neigh_size,:,:] = 0
-        if self.splits*l1 < self.window_size:
+        if self.splits*self.l1 < self.window_size:
             K_end = keys[:,self.split_indexes_KV_end,:,:]
             K_split = torch.cat((K_split,K_end.unsqueeze(0)), 0)
 
@@ -600,7 +581,7 @@ class LocalAttention(nn.Module):
         V_expand = values.unsqueeze(0).expand(self.splits, B, L, H, E).permute(1,0,2,3,4)
         V_split = V_expand[:, torch.arange(self.splits).unsqueeze(1), self.split_indexes_KV, :].transpose(0,1)
         V_split[0,:,:self.neigh_size,:,:] = 0
-        if self.splits*l1 < self.window_size:
+        if self.splits*self.l1 < self.window_size:
             V_end = values[:,self.split_indexes_KV_end,:,:]
             V_split = torch.cat((V_split,V_end.unsqueeze(0)), 0)
 
@@ -609,7 +590,7 @@ class LocalAttention(nn.Module):
         S_masked = torch.zeros_like(S)
         S_masked[0] = S[0] + self.local_mask_start
 
-        if self.splits*l1 < self.window_size:
+        if self.splits*self.l1 < self.window_size:
             S_masked[1:-1] = S[1:-1] + self.local_mask_middle
             S_masked[-1, :, :, :] = S_masked[-1, :, :, :] + self.local_mask_end  
 
@@ -624,7 +605,7 @@ class LocalAttention(nn.Module):
 
         # Compute V as the sum A_ij values_j over j
         output = torch.einsum("sbhlt,sbthd->sblhd", A.float(), V_split.float())
-        output = torch.cat(torch.tensor_split(output, torch.arange(1,self.splits + 1*(self.splits*l1 < self.window_size)), 0),2).squeeze(0)
+        output = torch.cat(torch.tensor_split(output, torch.arange(1,self.splits + 1*(self.splits*self.l1 < self.window_size)), 0),2).squeeze(0)
         output_refined = output[:,:self.window_size,:,:]
         if debugging:
             return Q_split, K_split, V_split, S, S_masked, A, V_split, output_refined
