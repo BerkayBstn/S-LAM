@@ -355,11 +355,10 @@ class LocalAttention(nn.Module):
     Nacho Aguilera, Andres Herrera-Poyatos (2023).
     LocalTran: a transformer for time-series based on local attention mechanisms 
     """
-    def __init__(self, neigh_size = None, scale=None, attention_dropout=0.1, output_attention=False, splits = None, device="cuda:0", **kwargs):
+    def __init__(self, neigh_size = None, scale=None, attention_dropout=0.1, splits = None, device="cuda:0", **kwargs):
         super(LocalAttention, self).__init__()
         self.scale = scale
         self.dropout = nn.Dropout(attention_dropout)
-        self.output_attention = output_attention
         self.neigh_size = neigh_size
         self.splits = splits 
         self.local_mask_start = None
@@ -480,7 +479,7 @@ class LocalAttention(nn.Module):
             self.split_indexes_Q_end = None
             self.split_indexes_KV_end = None
 
-    def forward(self, queries, keys, values, debugging = False):
+    def forward(self, queries, keys, values, debugging = False, output_attention = False):
         """
         Forward pass of the local attention mechanism.
 
@@ -587,7 +586,7 @@ class LocalAttention(nn.Module):
             V_split = torch.cat((V_split,V_end.unsqueeze(0)), 0)
         
         # --- SDPA ---
-        if not self.output_attention and not debugging:
+        if not output_attention and not debugging:
             # Reshape for SDPA: [S, B, L, H, E] -> [S, B, H, L, E]
             q = Q_split.transpose(2, 3)
             k = K_split.transpose(2, 3)
@@ -640,7 +639,7 @@ class LocalAttention(nn.Module):
         if debugging:
             return Q_split, K_split, V_split, S, S_masked, A, V_split, output_refined
 
-        if self.output_attention:
+        if output_attention:
             A_full = torch.zeros(B, H, L, L).to(A.device)
             for slice in range(self.splits):
                 if slice == 0:
@@ -661,8 +660,6 @@ class LocalAttention(nn.Module):
                 A_full[:, :, i_idx[:, None], j_idx[None, :]] = A_slice
 
             return (output_refined.contiguous(), A.contiguous(), A_full.contiguous())
-        else:
-            return (output_refined.contiguous(), None, None)
 
 class AttentionLayer(nn.Module):
     """
@@ -747,6 +744,7 @@ class AttentionLayer(nn.Module):
     def forward(self, queries, keys, values, **kwargs):
         
         debugging = kwargs.get('debugging', False)
+        output_attention = kwargs.get('output_attention', False)
         # Extracts the dimensions of queries, keys, values.
         # B is the number of batches, L is the number of instances of the queries,
         # S is the number of instnaces of the keys.
@@ -767,11 +765,12 @@ class AttentionLayer(nn.Module):
                 queries,
                 keys,
                 values,
-                debugging=debugging
+                debugging=debugging,
+                output_attention=output_attention
             )
             return Q_split, K_split, V_split, S, S_masked, A, V_split, output_refined
         else:
-            out, attn, attn_full = self.inner_attention(queries, keys, values)
+            out, attn, attn_full = self.inner_attention(queries, keys, values, output_attention=output_attention)
             
 
         # Places for each variable, all the outputs of the heads for that variable continuously.
