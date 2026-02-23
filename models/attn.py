@@ -369,6 +369,8 @@ class LocalAttention(nn.Module):
         self.split_indexes = None
         self.l1 = None
         self.remainder = None
+        self.split_indexes_Q_end = None
+        self.split_indexes_KV_end = None
         self.device = device
  
     def config(self, window_size):
@@ -435,7 +437,7 @@ class LocalAttention(nn.Module):
         # Update splits if needed
         if self.splits == None or self.splits < 0 or self.neigh_size > self.window_size / self.splits:
             self.splits = self.window_size // self.neigh_size
-        self.l1 = self.window_size//self.splits # splits may not divide window_size, need to do this generalization and check if performance is affected
+        self.l1 = self.neigh_size
 
         # Compute the full mask M described in the comment above.
         self.full_mask = torch.tril(torch.ones((self.window_size, self.window_size), dtype=torch.double)) - torch.tril(torch.ones((self.window_size, self.window_size), dtype=torch.double),diagonal=-self.neigh_size)
@@ -467,10 +469,15 @@ class LocalAttention(nn.Module):
             self.remainder = self.window_size-self.splits*self.l1
 
             self.split_indexes_Q_end = self.l1 * self.splits + torch.arange(self.l1)
-            self.split_indexes_Q_end[self.remainder:] = torch.zeros(self.l1 - self.remainder)
+            self.split_indexes_Q_end[self.remainder:] = 0
 
-            self.split_indexes_KV_end = self.l1*self.splits - self.neigh_size + torch.arange(self.l1 + self.neigh_size - 1)
-            self.split_indexes_KV_end[self.remainder:] = 0
+            self.split_indexes_KV_end = self.l1*self.splits - self.neigh_size + torch.arange(1, self.l1 + self.neigh_size)
+            self.split_indexes_KV_end[self.remainder+self.neigh_size-1:] = 0
+
+        else:
+            self.remainder = None
+            self.split_indexes_Q_end = None
+            self.split_indexes_KV_end = None
 
     def forward(self, queries, keys, values, debugging = False):
         """
@@ -541,10 +548,11 @@ class LocalAttention(nn.Module):
 
         # Dynamically recalculate chunking indices and masks if the sequence length changes
         if self.window_size != L or self.window_size is None:
+            # print(f"Sequence length changed from {self.window_size} to {L}. Recalculating splits and masks.")
             # Force recalculation of optimal splits for the current sequence length
-            self.splits = L // self.neigh_size 
+            self.splits = L // self.neigh_size
             self.config(window_size=L)
-            
+
             # Ensure the newly generated index tensors are on the correct GPU/device
             self.split_indexes_Q = self.split_indexes_Q.to(queries.device)
             self.split_indexes_KV = self.split_indexes_KV.to(keys.device)
@@ -554,24 +562,14 @@ class LocalAttention(nn.Module):
                 self.split_indexes_KV_end = self.split_indexes_KV_end.to(keys.device)
         # ----
 
-        # BUG: window size is 1 at some point of the execution, therefore this does not works. This could be due to
-        # changing the model from autoencoder to predictor, but it should not happen. Check this.
-        self.l1 = self.window_size//self.splits
-
         # Split queries
         Q_expand = queries.unsqueeze(0).expand(self.splits, B, L, H, E).permute(1,0,2,3,4)
         Q_split = Q_expand[:, torch.arange(self.splits).unsqueeze(1), self.split_indexes_Q, :].transpose(0,1)
-        if self.splits*self.l1 < self.window_size:
-            Q_end = queries[:,self.split_indexes_Q_end,:,:]
-            Q_split = torch.cat((Q_split,Q_end.unsqueeze(0)), 0)
         
         # Split keys (here we need more rows per block to capture the attention scores of queries and those elements of keys at positions j l1 - neigh_size to j l1.
         K_expand = keys.unsqueeze(0).expand(self.splits, B, L, H, E).permute(1,0,2,3,4)
         K_split = K_expand[:, torch.arange(self.splits).unsqueeze(1), self.split_indexes_KV, :].transpose(0,1)
         K_split[0,:,:self.neigh_size,:,:] = 0
-        if self.splits*self.l1 < self.window_size:
-            K_end = keys[:,self.split_indexes_KV_end,:,:]
-            K_split = torch.cat((K_split,K_end.unsqueeze(0)), 0)
 
         # Step 1 of algorithm (see above)
         # K_sample is a B x H x L_Q x sample_k x D tensor.
@@ -581,8 +579,18 @@ class LocalAttention(nn.Module):
         V_expand = values.unsqueeze(0).expand(self.splits, B, L, H, E).permute(1,0,2,3,4)
         V_split = V_expand[:, torch.arange(self.splits).unsqueeze(1), self.split_indexes_KV, :].transpose(0,1)
         V_split[0,:,:self.neigh_size,:,:] = 0
-        if self.splits*self.l1 < self.window_size:
+
+        if self.remainder is not None:
+            Q_end = queries[:,self.split_indexes_Q_end,:,:]
+            Q_end[:, self.remainder:, : ,: ] = 0
+            Q_split = torch.cat((Q_split,Q_end.unsqueeze(0)), 0)
+
+            K_end = keys[:,self.split_indexes_KV_end,:,:]
+            K_end[:, self.remainder+self.neigh_size-1:, : ,: ] = 0
+            K_split = torch.cat((K_split,K_end.unsqueeze(0)), 0)
+
             V_end = values[:,self.split_indexes_KV_end,:,:]
+            V_end[:, self.remainder+self.neigh_size-1:, : ,: ] = 0
             V_split = torch.cat((V_split,V_end.unsqueeze(0)), 0)
 
         S = torch.einsum("sblhe,sbthe->sbhlt", Q_split, K_split)
@@ -590,9 +598,9 @@ class LocalAttention(nn.Module):
         S_masked = torch.zeros_like(S)
         S_masked[0] = S[0] + self.local_mask_start
 
-        if self.splits*self.l1 < self.window_size:
+        if self.remainder is not None:
             S_masked[1:-1] = S[1:-1] + self.local_mask_middle
-            S_masked[-1, :, :, :] = S_masked[-1, :, :, :] + self.local_mask_end  
+            S_masked[-1, :, :, :] = S[-1, :, :, :] + self.local_mask_end  
 
         else:
             S_masked[1:] = S[1:] + self.local_mask_middle
@@ -611,9 +619,28 @@ class LocalAttention(nn.Module):
             return Q_split, K_split, V_split, S, S_masked, A, V_split, output_refined
 
         if self.output_attention:
-            return (output_refined.contiguous(),A.contiguous())
+            A_full = torch.zeros(B, H, L, L).to(A.device)
+            for slice in range(self.splits):
+                if slice == 0:
+                    i_idx = self.split_indexes_Q[slice]
+                    j_idx = self.split_indexes_KV[slice, self.neigh_size-1:]
+                    A_slice = A[slice, :, :, :, self.neigh_size-1:]
+                else:
+                    i_idx = self.split_indexes_Q[slice]
+                    j_idx = self.split_indexes_KV[slice]
+                    A_slice = A[slice, :, :, :, :]
+
+                A_full[:, :, i_idx[:, None], j_idx] = A_slice
+
+            if self.remainder is not None:
+                i_idx = self.split_indexes_Q_end[:self.remainder]
+                j_idx = self.split_indexes_KV_end[:self.remainder+self.neigh_size-1]
+                A_slice = A[-1, :, :, :self.remainder, :self.remainder+self.neigh_size-1]
+                A_full[:, :, i_idx[:, None], j_idx[None, :]] = A_slice
+
+            return (output_refined.contiguous(), A.contiguous(), A_full.contiguous())
         else:
-            return (output_refined.contiguous(), None)
+            return (output_refined.contiguous(), None, None)
 
 class AttentionLayer(nn.Module):
     """
@@ -722,11 +749,12 @@ class AttentionLayer(nn.Module):
             )
             return Q_split, K_split, V_split, S, S_masked, A, V_split, output_refined
         else:
-            out, attn = self.inner_attention(queries, keys, values)
+            out, attn, attn_full = self.inner_attention(queries, keys, values)
+            
 
         # Places for each variable, all the outputs of the heads for that variable continuously.
         if self.mix:
             out = out.transpose(2,1)
             
         out = out.view(B, L, -1).contiguous()
-        return self.out_projection(out), attn
+        return self.out_projection(out), attn, attn_full
