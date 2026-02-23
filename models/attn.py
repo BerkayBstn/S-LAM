@@ -440,21 +440,22 @@ class LocalAttention(nn.Module):
         self.l1 = self.neigh_size
 
         # Compute the full mask M described in the comment above.
-        self.full_mask = torch.tril(torch.ones((self.window_size, self.window_size), dtype=torch.double)) - torch.tril(torch.ones((self.window_size, self.window_size), dtype=torch.double),diagonal=-self.neigh_size)
-        self.full_mask = self.full_mask.to(self.device)
+        full_mask = torch.tril(torch.ones((self.window_size, self.window_size), dtype=torch.double)) - torch.tril(torch.ones((self.window_size, self.window_size), dtype=torch.double),diagonal=-self.neigh_size)
+        full_mask = full_mask.to(self.device)
         #Replace 0 with -np.inf
-        self.full_mask = self.full_mask.masked_fill(self.full_mask == 0, -sys.maxsize)
-        self.full_mask = self.full_mask.masked_fill(self.full_mask == 1, 0)
+        full_mask = full_mask.masked_fill(full_mask == 0, -sys.maxsize)
+        full_mask = full_mask.masked_fill(full_mask == 1, 0)
 
         # Local masks have dimensions:
         # l1 x l1
         # l1 x (l1+self.neigh_size)
         # (L-l_end) x (L-l_end+self.neigh_size)
         # We have a row for each input, and in each row we have the neigh_size ones corresponding to the attention scores computed.
-        self.local_mask_start = torch.cat((torch.full((self.l1, self.l1 - 1), -sys.maxsize), self.full_mask[0:self.l1, 0:self.l1]), dim=1)
-        self.local_mask_middle = self.full_mask[self.l1:2*self.l1, self.l1-self.neigh_size + 1:2*self.l1]
+        self.local_mask_start = torch.cat((torch.full((self.l1, self.l1 - 1), -sys.maxsize), full_mask[0:self.l1, 0:self.l1]), dim=1)
+        self.local_mask_middle = full_mask[self.l1:2*self.l1, self.l1-self.neigh_size + 1:2*self.l1].clone()
         self.local_mask_end = self.local_mask_middle.clone()
         self.local_mask_end[self.window_size-self.l1*self.splits:,:] = -sys.maxsize
+        del full_mask
 
         # Indexes where we will split Q.
         i = torch.arange(self.l1)
@@ -614,7 +615,7 @@ class LocalAttention(nn.Module):
         # Compute V as the sum A_ij values_j over j
         output = torch.einsum("sbhlt,sbthd->sblhd", A.float(), V_split.float())
         output = torch.cat(torch.tensor_split(output, torch.arange(1,self.splits + 1*(self.splits*self.l1 < self.window_size)), 0),2).squeeze(0)
-        output_refined = output[:,:self.window_size,:,:]
+        output_refined = output[:,:self.window_size,:,:] #  when remainder is not None, remove extra rows added to make splits work. When remainder is None, this does not change anything.
         if debugging:
             return Q_split, K_split, V_split, S, S_masked, A, V_split, output_refined
 
