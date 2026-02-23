@@ -559,7 +559,7 @@ class LocalAttention(nn.Module):
         self.scale = self.scale or 1./math.sqrt(E)
 
         # Dynamically recalculate chunking indices and masks if the sequence length changes
-        if self.window_size != L:
+        if self.window_size != L or self.window_size is None:
             # Force recalculation of optimal splits for the current sequence length
             self.splits = L // self.neigh_size 
             self.config(window_size=L)
@@ -693,7 +693,7 @@ class AttentionLayer(nn.Module):
     >>> attn = FullAttention(output_attention=True)
     >>> attn_layer = AttentionLayer(attn, 103, 5, d_keys = 20, d_values = 20)    
     """
-    def __init__(self, attention, window_size, d_model, n_heads, d_keys=None, d_values=None, mix=False, batch_first=None, **kwargs):
+    def __init__(self, attention, d_model, n_heads, d_keys=None, d_values=None, mix=False, batch_first=None, **kwargs):
         super(AttentionLayer, self).__init__()
         self.batch_first = batch_first
 
@@ -714,8 +714,8 @@ class AttentionLayer(nn.Module):
         self.n_heads = n_heads
         self.mix = mix
 
-        # Configurate the attention mechanism with the window size (only really needed for local attention) 
-        self.inner_attention.config(window_size)
+        # # Configurate the attention mechanism with the window size (only really needed for local attention) 
+        # self.inner_attention.config(window_size)
 
     def forward(self, queries, keys, values, **kwargs):
         
