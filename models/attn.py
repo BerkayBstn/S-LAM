@@ -451,7 +451,7 @@ class LocalAttention(nn.Module):
         # l1 x (l1+self.neigh_size)
         # (L-l_end) x (L-l_end+self.neigh_size)
         # We have a row for each input, and in each row we have the neigh_size ones corresponding to the attention scores computed.
-        self.local_mask_start = torch.cat((torch.full((self.l1, self.l1 - 1), -sys.maxsize), full_mask[0:self.l1, 0:self.l1]), dim=1)
+        self.local_mask_start = torch.cat((torch.full((self.l1, self.l1 - 1), -sys.maxsize, device=full_mask.device), full_mask[0:self.l1, 0:self.l1]), dim=1)
         self.local_mask_middle = full_mask[self.l1:2*self.l1, self.l1-self.neigh_size + 1:2*self.l1].clone()
         self.local_mask_end = self.local_mask_middle.clone()
         self.local_mask_end[self.window_size-self.l1*self.splits:,:] = -sys.maxsize
@@ -549,8 +549,6 @@ class LocalAttention(nn.Module):
 
         # Dynamically recalculate chunking indices and masks if the sequence length changes
         if self.window_size != L or self.window_size is None:
-            # print(f"Sequence length changed from {self.window_size} to {L}. Recalculating splits and masks.")
-            # Force recalculation of optimal splits for the current sequence length
             self.splits = L // self.neigh_size
             self.config(window_size=L)
 
@@ -561,21 +559,15 @@ class LocalAttention(nn.Module):
                 self.split_indexes_Q_end = self.split_indexes_Q_end.to(queries.device)
             if self.split_indexes_KV_end is not None:
                 self.split_indexes_KV_end = self.split_indexes_KV_end.to(keys.device)
-        # ----
 
         # Split queries
         Q_expand = queries.unsqueeze(0).expand(self.splits, B, L, H, E).permute(1,0,2,3,4)
         Q_split = Q_expand[:, torch.arange(self.splits).unsqueeze(1), self.split_indexes_Q, :].transpose(0,1)
         
-        # Split keys (here we need more rows per block to capture the attention scores of queries and those elements of keys at positions j l1 - neigh_size to j l1.
+        # Split keys
         K_expand = keys.unsqueeze(0).expand(self.splits, B, L, H, E).permute(1,0,2,3,4)
         K_split = K_expand[:, torch.arange(self.splits).unsqueeze(1), self.split_indexes_KV, :].transpose(0,1)
         K_split[0,:,:self.neigh_size,:,:] = 0
-
-        # Step 1 of algorithm (see above)
-        # K_sample is a B x H x L_Q x sample_k x D tensor.
-        # Each entry K_sample[b,h,l,:,:] is a list of size sample_k, and each element is a random row of K.
-        # In total, there are L_Q such lists. This takes memory O(B H D n log n).
 
         V_expand = values.unsqueeze(0).expand(self.splits, B, L, H, E).permute(1,0,2,3,4)
         V_split = V_expand[:, torch.arange(self.splits).unsqueeze(1), self.split_indexes_KV, :].transpose(0,1)
@@ -593,29 +585,58 @@ class LocalAttention(nn.Module):
             V_end = values[:,self.split_indexes_KV_end,:,:]
             V_end[:, self.remainder+self.neigh_size-1:, : ,: ] = 0
             V_split = torch.cat((V_split,V_end.unsqueeze(0)), 0)
+        
+        # --- SDPA ---
+        if not self.output_attention and not debugging:
+            # Reshape for SDPA: [S, B, L, H, E] -> [S, B, H, L, E]
+            q = Q_split.transpose(2, 3)
+            k = K_split.transpose(2, 3)
+            v = V_split.transpose(2, 3)
+            
+            # Construct attention mask (S, 1, 1, L, L)
+            attn_mask = torch.zeros((q.shape[0], 1, 1, q.shape[-2], k.shape[-2]), device=q.device, dtype=q.dtype)
+            attn_mask[0, 0, 0] = self.local_mask_start
+            
+            if self.remainder is not None:
+                attn_mask[1:-1, 0, 0] = self.local_mask_middle
+                attn_mask[-1, 0, 0] = self.local_mask_end
+            else:
+                attn_mask[1:, 0, 0] = self.local_mask_middle
+                
+            attn_mask = attn_mask.nan_to_num(-sys.maxsize)
+            
+            output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                scale=self.scale
+            )
+
+            # Revert shape: [S, B, H, L, E] -> [S, B, L, H, E]
+            output = output.transpose(2, 3)
+            output = torch.cat(torch.tensor_split(output, torch.arange(1,self.splits + 1*(self.splits*self.l1 < self.window_size)), 0),2).squeeze(0)
+            output_refined = output[:,:self.window_size,:,:]
+            
+            return (output_refined.contiguous(), None, None)
+        # --- END SDPA ---
 
         S = torch.einsum("sblhe,sbthe->sbhlt", Q_split, K_split)
-        # BUG: local_mask_middle turns into empty at some point and this line fails.
         S_masked = torch.zeros_like(S)
         S_masked[0] = S[0] + self.local_mask_start
 
         if self.remainder is not None:
             S_masked[1:-1] = S[1:-1] + self.local_mask_middle
             S_masked[-1, :, :, :] = S[-1, :, :, :] + self.local_mask_end  
-
         else:
             S_masked[1:] = S[1:] + self.local_mask_middle
 
-        S_masked = S_masked.nan_to_num(-sys.maxsize) # makes sure there is no np.inf * 0 product producing Nan, if so we send it back to -np.inf
-        # Scale the scores and apply softmax to compute the attention matrix (not applied S1 locally at the moment...)
+        S_masked = S_masked.nan_to_num(-sys.maxsize)
         A = self.dropout(torch.softmax(self.scale * S_masked, dim=-1))
         
-        # print(f"A type: {A.dtype}, V_split type: {V_split.dtype}")
-
-        # Compute V as the sum A_ij values_j over j
         output = torch.einsum("sbhlt,sbthd->sblhd", A.float(), V_split.float())
         output = torch.cat(torch.tensor_split(output, torch.arange(1,self.splits + 1*(self.splits*self.l1 < self.window_size)), 0),2).squeeze(0)
-        output_refined = output[:,:self.window_size,:,:] #  when remainder is not None, remove extra rows added to make splits work. When remainder is None, this does not change anything.
+        output_refined = output[:,:self.window_size,:,:] 
+
         if debugging:
             return Q_split, K_split, V_split, S, S_masked, A, V_split, output_refined
 
