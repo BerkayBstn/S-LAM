@@ -714,9 +714,6 @@ class AttentionLayer(nn.Module):
         self.n_heads = n_heads
         self.mix = mix
 
-        # # Configurate the attention mechanism with the window size (only really needed for local attention) 
-        # self.inner_attention.config(window_size)
-
     def forward(self, queries, keys, values, **kwargs):
         
         debugging = kwargs.get('debugging', False)
