@@ -1,5 +1,5 @@
 # S-LAM
-Local Attention Mechanism for time series forecasting proposed by Martos et al. This repo fixes bugs in the provided script by authors and improves efficiency by applying SDPA.
+Local Attention Mechanism for time series forecasting proposed by Martos et al. This repo fixes bugs in the script provided by the authors and improves efficiency by applying SDPA and parallelizing mask calculation. The current implementation also handles reconfiguring masks if a sequence with a different length is input to the model, whereas in the original application the configuration happens only once, and providing a different sequence length causes an error.
 
 # Reference
 
