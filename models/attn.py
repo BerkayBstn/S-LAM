@@ -366,13 +366,12 @@ class LocalAttention(nn.Module):
         self.local_mask_end = None
         self.window_size = None
         self.split_indexes = None
-        self.l1 = None
         self.remainder = None
         self.split_indexes_Q_end = None
         self.split_indexes_KV_end = None
         self.device = device
  
-    def config(self, window_size):
+    def config(self, window_size, mask_device = None):
         """
         Computes the local_masks for local attention. We need 3 local masks, one for the start, one for the end, and one for middle blocks.
         The idea is masking the attention scores (before soft max is applied) by 
@@ -436,13 +435,14 @@ class LocalAttention(nn.Module):
         # Update splits if needed
         if self.splits == None or self.splits < 0 or self.neigh_size > self.window_size / self.splits:
             self.splits = self.window_size // self.neigh_size
-        self.l1 = self.neigh_size
+
+        mask_device = self.device if mask_device == None else mask_device
 
         # Compute the full mask M described in the comment above.
         full_mask = torch.tril(torch.ones((self.window_size, self.window_size), dtype=torch.double)) - torch.tril(torch.ones((self.window_size, self.window_size), dtype=torch.double),diagonal=-self.neigh_size)
-        full_mask = full_mask.to(self.device)
+        full_mask = full_mask.to(mask_device)
         #Replace 0 with -np.inf
-        full_mask = full_mask.masked_fill(full_mask == 0, -sys.maxsize)
+        full_mask = full_mask.masked_fill(full_mask == 0, float('-inf'))
         full_mask = full_mask.masked_fill(full_mask == 1, 0)
 
         # Local masks have dimensions:
@@ -450,28 +450,28 @@ class LocalAttention(nn.Module):
         # l1 x (l1+self.neigh_size)
         # (L-l_end) x (L-l_end+self.neigh_size)
         # We have a row for each input, and in each row we have the neigh_size ones corresponding to the attention scores computed.
-        self.local_mask_start = torch.cat((torch.full((self.l1, self.l1 - 1), -sys.maxsize, device=full_mask.device), full_mask[0:self.l1, 0:self.l1]), dim=1)
-        self.local_mask_middle = full_mask[self.l1:2*self.l1, self.l1-self.neigh_size + 1:2*self.l1].clone()
+        self.local_mask_start = torch.cat((torch.full((self.neigh_size, self.neigh_size - 1), float('-inf'), device=full_mask.device), full_mask[0:self.neigh_size, 0:self.neigh_size]), dim=1)
+        self.local_mask_middle = full_mask[self.neigh_size:2*self.neigh_size, self.neigh_size-self.neigh_size + 1:2*self.neigh_size].clone()
         self.local_mask_end = self.local_mask_middle.clone()
-        self.local_mask_end[self.window_size-self.l1*self.splits:,:] = -sys.maxsize
+        self.local_mask_end[self.window_size-self.neigh_size*self.splits:,:] = float('-inf')
         del full_mask
 
         # Indexes where we will split Q.
-        i = torch.arange(self.l1)
-        j = torch.arange(self.l1 + self.neigh_size - 1)
+        i = torch.arange(self.neigh_size)
+        j = torch.arange(self.neigh_size + self.neigh_size - 1)
         r = torch.arange(self.splits)
 
-        self.split_indexes_Q =  r.unsqueeze(1) * self.l1 + i.unsqueeze(0) # i_glob = (r x l1) + i
-        self.split_indexes_KV = r.unsqueeze(1)*self.l1 - self.neigh_size + 1 + j.unsqueeze(0) # j_glob = (r x l1) - neigh_size + 1 + j
+        self.split_indexes_Q =  r.unsqueeze(1) * self.neigh_size + i.unsqueeze(0) # i_glob = (r x l1) + i
+        self.split_indexes_KV = r.unsqueeze(1)*self.neigh_size - self.neigh_size + 1 + j.unsqueeze(0) # j_glob = (r x l1) - neigh_size + 1 + j
         self.split_indexes_KV[0, :self.neigh_size-1] = 0
         
-        if self.splits*self.l1 < self.window_size:
-            self.remainder = self.window_size-self.splits*self.l1
+        if self.splits*self.neigh_size < self.window_size:
+            self.remainder = self.window_size-self.splits*self.neigh_size
 
-            self.split_indexes_Q_end = self.l1 * self.splits + torch.arange(self.l1)
+            self.split_indexes_Q_end = self.neigh_size * self.splits + torch.arange(self.neigh_size)
             self.split_indexes_Q_end[self.remainder:] = 0
 
-            self.split_indexes_KV_end = self.l1*self.splits - self.neigh_size + torch.arange(1, self.l1 + self.neigh_size)
+            self.split_indexes_KV_end = self.neigh_size*self.splits - self.neigh_size + torch.arange(1, self.neigh_size + self.neigh_size)
             self.split_indexes_KV_end[self.remainder+self.neigh_size-1:] = 0
 
         else:
@@ -549,7 +549,7 @@ class LocalAttention(nn.Module):
         # Dynamically recalculate chunking indices and masks if the sequence length changes
         if self.window_size != L or self.window_size is None:
             self.splits = L // self.neigh_size
-            self.config(window_size=L)
+            self.config(window_size=L, mask_device=queries.device)
 
             # Ensure the newly generated index tensors are on the correct GPU/device
             self.split_indexes_Q = self.split_indexes_Q.to(queries.device)
@@ -602,7 +602,7 @@ class LocalAttention(nn.Module):
             else:
                 attn_mask[1:, 0, 0] = self.local_mask_middle
                 
-            attn_mask = attn_mask.nan_to_num(-sys.maxsize)
+            # attn_mask = attn_mask.nan_to_num(float('-inf'))
             
             output = F.scaled_dot_product_attention(
                 q, k, v,
@@ -613,7 +613,7 @@ class LocalAttention(nn.Module):
 
             # Revert shape: [S, B, H, L, E] -> [S, B, L, H, E]
             output = output.transpose(2, 3)
-            output = torch.cat(torch.tensor_split(output, torch.arange(1,self.splits + 1*(self.splits*self.l1 < self.window_size)), 0),2).squeeze(0)
+            output = torch.cat(torch.tensor_split(output, torch.arange(1,self.splits + 1*(self.splits*self.neigh_size < self.window_size)), 0),2).squeeze(0)
             output_refined = output[:,:self.window_size,:,:]
             
             return (output_refined.contiguous(), None, None)
@@ -629,11 +629,11 @@ class LocalAttention(nn.Module):
         else:
             S_masked[1:] = S[1:] + self.local_mask_middle
 
-        S_masked = S_masked.nan_to_num(-sys.maxsize)
+        # S_masked = S_masked.nan_to_num(float('-inf'))
         A = self.dropout(torch.softmax(self.scale * S_masked, dim=-1))
         
         output = torch.einsum("sbhlt,sbthd->sblhd", A.float(), V_split.float())
-        output = torch.cat(torch.tensor_split(output, torch.arange(1,self.splits + 1*(self.splits*self.l1 < self.window_size)), 0),2).squeeze(0)
+        output = torch.cat(torch.tensor_split(output, torch.arange(1,self.splits + 1*(self.splits*self.neigh_size < self.window_size)), 0),2).squeeze(0)
         output_refined = output[:,:self.window_size,:,:] 
 
         if debugging:
