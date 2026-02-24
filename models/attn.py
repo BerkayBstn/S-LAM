@@ -566,11 +566,11 @@ class LocalAttention(nn.Module):
         # Split keys
         K_expand = keys.unsqueeze(0).expand(self.splits, B, L, H, E).permute(1,0,2,3,4)
         K_split = K_expand[:, torch.arange(self.splits).unsqueeze(1), self.split_indexes_KV, :].transpose(0,1)
-        K_split[0,:,:self.neigh_size,:,:] = 0
+        K_split[0,:,:self.neigh_size-1,:,:] = 0
 
         V_expand = values.unsqueeze(0).expand(self.splits, B, L, H, E).permute(1,0,2,3,4)
         V_split = V_expand[:, torch.arange(self.splits).unsqueeze(1), self.split_indexes_KV, :].transpose(0,1)
-        V_split[0,:,:self.neigh_size,:,:] = 0
+        V_split[0,:,:self.neigh_size-1,:,:] = 0
 
         if self.remainder is not None:
             Q_end = queries[:,self.split_indexes_Q_end,:,:]
